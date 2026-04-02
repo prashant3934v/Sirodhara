@@ -1,0 +1,883 @@
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebSocketsServer.h>
+#include <ESPmDNS.h>
+#include <ArduinoJson.h>
+#include "time.h"
+#include <sys/time.h>
+#include <Preferences.h>
+#include <math.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+long motor2StepsRemaining = 0;
+bool motor2Dir = true;
+unsigned long lastMotor2StepTime = 0;
+const int motor2SpeedDelay = 700; // microseconds
+
+// ==================== PIN CONFIGURATION ====================
+#define STEP_PIN 26
+#define DIR_PIN 25
+#define PUMP_PIN 14
+#define HEATER_PIN 22
+#define ONE_WIRE_BUS 27
+#define TS_CS 21
+#define NTC_PIN 34   // ADC pin (input only)
+#define STEP_PIN_2 33
+#define DIR_PIN_2 32
+float ntcTemp = 0.0;
+
+// ==================== TOUCH CALIBRATION ====================
+#define TS_MINX 200
+#define TS_MAXX 3800
+#define TS_MINY 200
+#define TS_MAXY 3800
+
+#define SERIES_RESISTOR 10000.0
+#define NOMINAL_RESISTANCE 100000.0
+#define NOMINAL_TEMPERATURE 25.0
+#define BETA_COEFFICIENT 3950.0
+
+ 
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+int motor2Rotation = 0;
+int lastMotor2Value = 0;
+// ====== WebSocket server on port 81 ======
+WebSocketsServer wsServer(81);
+
+// ==================== CONSTANTS ====================
+const int PULSES_PER_REV = 6400;
+const int TOUCH_SAMPLES = 1;
+const unsigned long TIMER_UPDATE_INTERVAL = 1000;
+const unsigned long BT_TEMP_SEND_INTERVAL = 2000;
+
+const unsigned long TAP_DEBOUNCE_MS = 200; 
+unsigned long lastTouchTime = 0;           
+
+// For time synchronization
+unsigned long lastSyncMillis = 0;
+const unsigned long syncInterval = 3600000;
+const unsigned long SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+
+// last deep sync timestamp
+unsigned long lastSync = 0;
+const unsigned long DATA_SYNC_INTERVAL = 5 * 60 * 1000; 
+
+
+// ==================== DATA STRUCTURES ====================
+struct Button {
+  int x, y, w, h;
+  const char* label;
+  bool active;
+};
+
+struct Slider {
+  int x, y, w, h;
+  int maxVal;
+  int* val;
+  const char* label;
+};
+
+template <typename T, size_t N>
+constexpr size_t len(const T (&)[N]) {
+    return N;
+}
+
+enum OscState { 
+  TO_POS, 
+  TO_ZERO_FROM_POS, 
+  TO_NEG, 
+  TO_ZERO_FROM_NEG 
+};
+
+enum BitFlags {
+  FLAG_TIMER = 0x0001,
+  FLAG_FLOW_CHANGED = 0x0002,
+  FLAG_ANGLE_CHANGED = 0x0004,
+  FLAG_SPEED_CHANGED = 0x0008,
+  FLAG_INBUILT = 0x0040,
+  FLAG_TEMPERATURE = 0x0080,
+  FLAG_EXTRA_1 = 0x0100,
+  FLAG_ALL = 0xFFFF
+};
+
+// ==================== GLOBAL OBJECTS ====================
+TFT_eSPI tft = TFT_eSPI();
+XPT2046_Touchscreen ts(TS_CS);
+Preferences preferences;
+
+// ==================== CONTROL STATE ====================
+bool stopFlag = false;
+bool pumpRunning = false;
+bool heaterState = false;
+bool deviceConnected = false;
+int connectedID = -1;
+bool isRunning = false;
+
+int pumpSpeed = 180;
+int stepsPerSec = 1500;
+int oscAngleDeg = 40;
+int flow = 10;
+int angle = 14;
+int speed = 5;
+int totalSeconds = 30 * 60;
+int remainingSeconds = 30 * 60;
+
+long stepsToMove = (PULSES_PER_REV * oscAngleDeg) / 360;
+long currentStepPos = 0;
+unsigned long lastStepTime = 0;
+float currentTemp = 0.0;
+
+uint16_t bitFlag = 0;
+bool currentDir = HIGH;
+OscState oscState = TO_POS;
+
+int inbuiltFluidIndex = -1;
+
+// ==================== UI ELEMENTS ====================
+Button startBtn = {0, 280, 60, 40, "Start", false};
+Button stopBtn  = {90, 280, 60, 40, "Stop", false};
+Button fluidButtons[3] = {
+  {10, 30, 60, 30, "Flush", false},
+  {80, 30, 60, 30, "Oil", false},
+  {150, 30, 60, 30, "Water", false}
+};
+
+Slider sliders[4] = {
+  {30, 80, 200, 30, 30, &flow, "Flow"},
+  {30, 130, 200, 30, 30, &speed, "Speed"},
+  {30, 180, 200, 30, 90, &angle, "Angle"},
+  {30, 230, 200, 30, 10, &motor2Rotation, "M2 Rot"}
+};
+
+void startMotor2Move(int rotations) {
+  motor2StepsRemaining = abs(rotations) * PULSES_PER_REV;
+  motor2Dir = rotations > 0;
+
+  digitalWrite(DIR_PIN_2, motor2Dir ? HIGH : LOW);
+}
+
+void runMotor2() {
+  if (motor2StepsRemaining <= 0) return;
+
+  unsigned long now = micros();
+
+  if (now - lastMotor2StepTime >= motor2SpeedDelay) {
+    lastMotor2StepTime = now;
+
+    digitalWrite(STEP_PIN_2, HIGH);
+    delayMicroseconds(2);
+    digitalWrite(STEP_PIN_2, LOW);
+
+    motor2StepsRemaining--;
+  }
+}
+
+//floward declerations of functions
+void handleFluidButtonPress(int buttonIndex);
+
+void checkSketchSpace() {
+  size_t sketchSize = ESP.getSketchSize();
+  size_t freeSketchSpace = ESP.getFreeSketchSpace();
+
+  Serial.printf("Sketch Size: %u bytes\n", sketchSize);
+  Serial.printf("Free Sketch Space: %u bytes\n", freeSketchSpace);
+}
+
+// ==================== UI DRAWING FUNCTIONS ====================
+void drawSlider(const Slider& s) {
+  tft.fillRect(s.x, s.y, s.w, s.h, TFT_DARKGREY);
+  int fill = map(*s.val, 0, s.maxVal, 0, s.w);
+  tft.fillRect(s.x, s.y, fill, s.h, TFT_BLUE);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  tft.setCursor(s.x, s.y - 16);
+  tft.print(s.label);
+  String buf = *s.val < 10 ? "0" + String(*s.val) : String(*s.val);
+  tft.setCursor(s.x + s.w + 5, s.y + s.h / 2 - 8);
+  tft.print(buf);
+}
+
+void drawButton(const Button& btn, uint16_t color) {
+  tft.fillRect(btn.x, btn.y, btn.w, btn.h, color);
+  tft.setTextSize(2);
+tft.setTextColor(TFT_WHITE);
+tft.setTextDatum(MC_DATUM);  // center
+
+tft.drawString(btn.label, btn.x + btn.w/2, btn.y + btn.h/2);
+}
+
+void drawTemperature() {
+  int x = 5;
+  int y = 5;
+  int w = 100;
+  int h = 20;
+
+  tft.fillRect(x, y, w, h, TFT_WHITE);   // clear area
+
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);                    // better visibility
+
+  tft.setTextDatum(MC_DATUM);            //  center alignment
+
+  String tempStr = String(currentTemp, 1) + " C";
+
+  tft.drawString(tempStr, x + w/2, y + h/2);  // center of box
+}
+
+void drawTimer() {
+  const int timerX = 180;
+  const int timerY = 280;
+  const int timerW = 100;
+  const int timerH = 40;
+  int minutes = remainingSeconds / 60;
+  int seconds = remainingSeconds % 60;
+  String buf = (minutes < 10 ? "0" + String(minutes) : String(minutes)) + ":" + (seconds < 10 ? "0" + String(seconds) : String(seconds));
+  tft.fillRect(timerX, timerY, timerW, timerH, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_YELLOW);
+  tft.setCursor(timerX + 15, timerY + 10);
+  tft.print(buf);
+}
+
+void refreshAllUIElements() {
+  for (int i = 0; i < len(sliders); i++) {
+    drawSlider(sliders[i]);
+  }
+  for( int i = 0; i<len(fluidButtons);i++){
+    drawButton(fluidButtons[i],fluidButtons[i].active?TFT_ORANGE:TFT_DARKGREY);
+  }
+  drawButton(startBtn, TFT_GREEN);
+  drawButton(stopBtn, TFT_RED);
+  drawTimer();
+}
+
+// ==================== HELPER FUNCTIONS ====================
+void updateMotorParameters() {
+  pumpSpeed = map(flow, 0, 30, 0, 255);
+  stepsPerSec = map(speed, 0, 30, 0, 7000);
+  oscAngleDeg = constrain(angle, 0, 90);
+  stepsToMove = (PULSES_PER_REV * oscAngleDeg) / 360;
+}
+
+void initializeWifi(const char* newSSID = NULL, const char* newPassword = NULL, bool isOpen = false) {
+  Serial.println("Initializing WiFi...");
+  bool isNew = (newSSID != NULL);
+  WiFi.mode(WIFI_STA);
+
+  if (isNew) {
+    Serial.print("Connecting to new network: ");
+    Serial.println(newSSID);
+    WiFi.begin(newSSID, newPassword);
+  } else {
+    preferences.begin("wifi", true);
+    String savedSSID = preferences.getString("ssid", "shirodhara");
+    String savedPassword = preferences.getString("password", "12345678");
+    bool savedIsOpen = preferences.getBool("isOpen", false);
+    preferences.end();
+    
+    Serial.print("Connecting to saved network: ");
+    Serial.println(savedSSID);
+    if (savedIsOpen) {
+      WiFi.begin(savedSSID);
+    } else {
+      WiFi.begin(savedSSID, savedPassword);
+    }
+  }
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+    Serial.print(".");
+  }
+ if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi connected");
+    Serial.println(WiFi.localIP());
+    if (isNew) {
+      preferences.begin("wifi", false);
+      preferences.putString("ssid", newSSID);
+      preferences.putString("password", newPassword != NULL ? newPassword : "");
+      preferences.putBool("isOpen", isOpen);
+      preferences.end();
+      Serial.println("✓ New WiFi credentials saved");
+    }
+  } else {
+    Serial.println("\n✗ WiFi connection FAILED!");
+  }
+}
+
+void startAdvertisement(){
+  if (!MDNS.begin("ESP32")) {       
+    Serial.println("Error starting mDNS");
+  } else {
+    MDNS.addService("ws", "tcp", 81); 
+    Serial.println("mDNS responder started as ESP32.local");
+  }
+}
+
+void syncTime() {
+  if(WiFi.status() != WL_CONNECTED) {
+    Serial.println("Cannot sync time: WiFi not connected");
+    return;
+  }
+  configTime(0, 0, "pool.ntp.org","time.google.com");
+
+  struct tm timeinfo;
+  int retry = 0;
+  const int maxRetry = 5;
+
+  while (!getLocalTime(&timeinfo) && retry < maxRetry) {
+    retry++;
+    Serial.println(".");
+    delay(500);
+  }
+  lastSyncMillis = millis();
+}
+
+long long getEpochMillis() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+}
+
+
+// ==================== BLE DATA FUNCTIONS ====================
+String createDataPacket(bool sendAll = true) {
+  uint16_t flags = sendAll ? FLAG_ALL : bitFlag;
+  JsonDocument doc; 
+  if(flags & FLAG_TIMER){
+    JsonObject timer = doc["tm"].to<JsonObject>();
+
+    unsigned long timeSinceSync = millis() - lastSyncMillis;
+    if (lastSyncMillis > 0 && timeSinceSync < SIX_HOURS_MS) {
+      timer["ts"] = getEpochMillis();
+    }
+    timer["run"] = isRunning;
+    timer["tt"] = totalSeconds;
+    timer["rm"] = remainingSeconds;
+  }  
+  
+  if(flags & (FLAG_FLOW_CHANGED | FLAG_ANGLE_CHANGED | FLAG_SPEED_CHANGED)) {
+    JsonObject status = doc["st"].to<JsonObject>();
+    if(flags & FLAG_FLOW_CHANGED) status["f"] = flow;
+    if(flags & FLAG_ANGLE_CHANGED) status["a"] = angle;
+    if(flags & FLAG_SPEED_CHANGED) status["s"] = speed;
+  }
+  if(flags & FLAG_TEMPERATURE) {
+    JsonObject tempObj = doc["extra"].to<JsonObject>();
+    tempObj["t"] = currentTemp;
+  }
+  if(flags & FLAG_INBUILT) {
+    JsonObject status = doc["st"].to<JsonObject>();
+    status["f"] = flow;
+    status["a"] = angle;
+    status["s"] = speed;
+    doc["inbuilt"] = inbuiltFluidIndex;
+  }
+  String buffer;
+  serializeJson(doc, buffer);
+  Serial.printf("Sending packet: %s\n", buffer.c_str());
+  return buffer;
+}
+
+void sendData(bool sendAll = false) {
+  if (!deviceConnected) return;
+  String packet = createDataPacket(sendAll);
+  wsServer.sendTXT(connectedID, packet);
+  if (sendAll) {
+    lastSync  = millis();
+  }
+  
+  bitFlag = 0;
+}
+
+// ==================== JSON & WS EVENT HANDLING ====================
+bool updateFromJson(const String& json) {
+  // Use Static to save heap fragmentation
+  JsonDocument doc;
+  Serial.printf("Received JSON: %s\n", json.c_str());
+  DeserializationError error = deserializeJson(doc, json);
+  
+  if (error) {
+    Serial.printf("JSON parse failed: %s\n", error.c_str());
+    return false;
+  }
+
+  // 1. Sync Request
+  if (doc["sy"]) {
+    sendData(true);
+    return true;
+  }
+
+  // 2. Status Updates (Sliders)
+  if (JsonVariantConst status = doc["st"]) {
+    if (status["f"].is<int>()) {
+      flow = status["f"];
+      drawSlider(sliders[0]);
+    }
+    if (status["a"].is<int>()) {
+      angle = status["a"];
+      drawSlider(sliders[2]);
+    }
+    if (status["s"].is<int>()) {
+      speed = constrain(status["s"].as<int>(), 0, 30);
+      stepsPerSec = map(speed, 0, 30, 0, 7000);
+      drawSlider(sliders[1]);
+    }
+    updateMotorParameters();
+  }
+
+  // 3. Timer Control
+  if (JsonVariantConst timer = doc["tm"]) {
+    if (timer["run"].is<bool>()) {
+      isRunning = timer["run"];
+    }
+    
+  if (timer["tt"].is<int>()) totalSeconds = timer["tt"];
+  if (timer["rm"].is<int>()) { 
+    if(timer["ts"].is<long long>() && (millis() - lastSyncMillis) < SIX_HOURS_MS) {
+      long long clientTs = timer["ts"];
+      long long now = getEpochMillis();
+      long long elapsed = now - clientTs;
+      if(elapsed >= 0 && elapsed < 10000) {
+        int adjustedRm = timer["rm"].as<int>() - (int)(elapsed / 1000);
+        remainingSeconds = (adjustedRm > 0) ? adjustedRm : 0;
+      } else {
+        remainingSeconds = timer["rm"];
+      }
+    } else {
+      remainingSeconds = timer["rm"];
+    }
+  }
+    
+    drawTimer();
+  }
+
+  JsonVariantConst wifi = doc["wf"];
+  if (!wifi.isNull()) {
+    if (wifi["id"] && wifi["pw"] && wifi["et"]) {
+      initializeWifi(wifi["id"], wifi["pw"], strcmp(wifi["et"], "open") == 0);
+    }
+  }
+
+  if (doc["inbuilt"].is<int>()) {
+  uint8_t fluidIndex = doc["inbuilt"];
+  if (fluidIndex < 3) {
+    handleFluidButtonPress(fluidIndex);
+    bitFlag |= FLAG_INBUILT;
+    sendData();
+  }
+  }
+
+  return true;
+}
+
+void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      if(deviceConnected) { wsServer.disconnect(num); return; }
+      deviceConnected = true;
+      connectedID = num;
+      MDNS.end();
+      sendData(true);
+      break;
+    }
+    case WStype_DISCONNECTED:
+      deviceConnected = false;
+      connectedID = -1;
+      startAdvertisement();
+      break;
+    case WStype_TEXT:
+    case WStype_BIN:
+      updateFromJson(String((char*)payload, length));
+      break;
+    default: break;
+  }
+}
+
+void initializeServer() {
+  wsServer.begin();
+  wsServer.onEvent(onWsEvent);
+  Serial.println("WebSocket server started");
+}
+
+// ==================== TOUCH HANDLING ====================
+void checkSliderTouch(int px, int py) {
+  px = constrain(px, 0, tft.width() - 1);
+
+  for (int i = 0; i < len(sliders); i++) {
+
+    Slider s = sliders[i];
+
+    if (py >= s.y && py <= s.y + s.h) {
+
+      int newVal = map(px, s.x, s.x + s.w, 0, s.maxVal);
+      newVal = constrain(newVal, 0, s.maxVal);
+
+      if (*s.val != newVal) {
+
+        if (i == 0) bitFlag |= FLAG_FLOW_CHANGED;
+        if (i == 1) bitFlag |= FLAG_SPEED_CHANGED;
+        if (i == 2) bitFlag |= FLAG_ANGLE_CHANGED;
+
+        *s.val = newVal;
+        drawSlider(s);
+        updateMotorParameters();
+
+        //  MOTOR 2 LOGIC
+        if (i == 3) {
+          int delta = newVal - lastMotor2Value;
+//  LIMIT movement per interaction
+if (delta > 2) delta = 2;
+if (delta < -2) delta = -2;
+
+if (delta != 0) {
+  startMotor2Move(delta);
+  lastMotor2Value += delta;   //  IMPORTANT (not = newVal)
+}
+        }
+
+        sendData();
+      }
+    }
+  }
+}
+
+void handleFluidButtonPress(int buttonIndex) {
+  if (buttonIndex == 0) { flow = 10; speed = 10; angle = 10; }
+  else if (buttonIndex == 1) { flow = 20; speed = 15; angle = 20; }
+  else if (buttonIndex == 2) { flow = 25; speed = 20; angle = 30; }
+  inbuiltFluidIndex = buttonIndex;
+
+  for(int i = 0; i < len(fluidButtons); i++) {
+    bool prev = fluidButtons[i].active;
+    fluidButtons[i].active = (i == buttonIndex);
+    if(prev != fluidButtons[i].active) {
+      drawButton(fluidButtons[i],fluidButtons[i].active?TFT_ORANGE:TFT_DARKGREY);
+    }
+  }
+  for (int i = 0; i < len(sliders); i++) drawSlider(sliders[i]);
+  updateMotorParameters();
+  bitFlag |= FLAG_FLOW_CHANGED | FLAG_ANGLE_CHANGED | FLAG_SPEED_CHANGED;
+  sendData();
+}
+
+bool isPointInButton(int px, int py, const Button& btn) {
+    unsigned long now = millis();
+    bool inButton = (px >= btn.x && px <= btn.x + btn.w && py >= btn.y && py <= btn.y + btn.h);
+    if (inButton && now - lastTouchTime > TAP_DEBOUNCE_MS) {
+        lastTouchTime = now;
+        return true;
+    }
+    return false;
+}
+
+void checkButtonTouch(int px, int py) {
+  if (isPointInButton(px, py, startBtn)) {
+    isRunning = true; stopFlag = false; bitFlag |= FLAG_TIMER;
+    drawTimer(); sendData(); return;
+  }
+  if (isPointInButton(px, py, stopBtn)) {
+    isRunning = false; stopFlag = true; bitFlag |= FLAG_TIMER;
+    drawTimer(); sendData(); return;
+  }
+  for (int i = 0; i < 3; i++) {
+    if (isPointInButton(px, py, fluidButtons[i])) {
+      handleFluidButtonPress(i);
+      return;
+    }
+  }
+}
+
+void handleTouchInput() {
+  TS_Point p = ts.getPoint();
+
+  int px = map(p.x, TS_MINX, TS_MAXX, 0, tft.width());
+  int py = map(p.y, TS_MINY, TS_MAXY, 0, tft.height());
+
+  checkSliderTouch(px, py);
+  checkButtonTouch(px, py);
+}
+
+// ==================== SYSTEM CORE ====================
+void initializePins() {
+  pinMode(STEP_PIN, OUTPUT); pinMode(DIR_PIN, OUTPUT);
+  pinMode(HEATER_PIN, OUTPUT); pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(DIR_PIN, currentDir);
+  digitalWrite(STEP_PIN, LOW); digitalWrite(HEATER_PIN, LOW);
+  analogWrite(PUMP_PIN, 0);
+pinMode(STEP_PIN_2, OUTPUT);
+pinMode(DIR_PIN_2, OUTPUT);
+digitalWrite(STEP_PIN_2, LOW);
+digitalWrite(DIR_PIN_2, LOW);
+}
+
+void initializeDisplay() {
+  tft.init(); tft.setRotation(0); tft.fillScreen(TFT_BLACK);
+  // Initialize touchscreen after TFT is ready
+  delay(100);  // Small delay to ensure SPI bus is stable
+  ts.begin(); ts.setRotation(0);
+}
+
+void initializeSensors() {
+  analogReadResolution(12);
+}
+void updateTimer() {
+  static unsigned long lastUpdate = 0;
+
+  static bool wasRunning = false;
+  if (isRunning && !wasRunning) {
+      lastUpdate = millis();
+      wasRunning = true;
+  }
+  if (!isRunning) wasRunning = false;
+  if (isRunning && (millis() - lastUpdate) > TIMER_UPDATE_INTERVAL) {
+    lastUpdate = millis();
+    remainingSeconds--;
+    if (remainingSeconds <= 0) { remainingSeconds = totalSeconds; isRunning = false; }
+    drawTimer();
+  }
+}
+//====================Thermistor Setup ====================
+float readTemperature() {
+  float tempC = sensors.getTempCByIndex(0);
+
+  if (tempC != DEVICE_DISCONNECTED_C) {
+    sensors.requestTemperatures(); // trigger next reading
+    return tempC;
+  }
+
+  Serial.println("DS18B20 not connected!");
+  return currentTemp;
+}
+// ------------------- Heater Control -------------------
+void controlHeater() {
+  static unsigned long lastRead = 0;
+
+  if (currentTemp > 50.0) {
+      digitalWrite(HEATER_PIN, LOW);
+      heaterState = false;
+      
+      lastRead = millis();
+      return;  //
+    }
+
+  if (millis() - lastRead > 5000) {
+
+    currentTemp = readTemperature();
+
+    if (fluidButtons[0].active || fluidButtons[1].active || fluidButtons[2].active) {
+      digitalWrite(HEATER_PIN, HIGH);
+      heaterState = true;
+    } 
+    else {
+      if (currentTemp < 40.0) {
+        digitalWrite(HEATER_PIN, HIGH);
+        heaterState = true;
+      } 
+      else {
+        digitalWrite(HEATER_PIN, LOW);
+        heaterState = false;
+      }
+    }
+
+    Serial.print("Temp: ");
+    Serial.print(currentTemp);
+    Serial.print(" °C, Heater: ");
+    Serial.print(heaterState ? "ON" : "OFF");
+    Serial.print(", Pump: ");
+    Serial.println(pumpRunning ? "ON" : "OFF");
+
+    lastRead = millis();
+  }
+}
+
+// ------------------- Pump Control -------------------
+
+   
+void controlPumpByTemp() {
+
+  
+
+  if (stopFlag || !isRunning) {
+  pumpRunning = false;
+} else {
+  if (!pumpRunning && currentTemp >= 38.0) {
+    pumpRunning = true;
+  }
+  else if (pumpRunning && currentTemp <= 36.0) {
+    pumpRunning = false;
+  }
+}
+
+ if (pumpRunning) {
+  analogWrite(PUMP_PIN, pumpSpeed); // 0–255
+} else {
+  analogWrite(PUMP_PIN, 0);
+}
+}
+
+// ------------------- Stepper Motor -------------------
+void setDirection(bool dir) {
+  if (dir != currentDir) {
+    digitalWrite(DIR_PIN, dir ? HIGH : LOW);
+    currentDir = dir;
+    delayMicroseconds(10);
+  }
+}
+
+void stepMotor() {
+  digitalWrite(STEP_PIN, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(STEP_PIN, LOW);
+}
+
+// ------------------- Stepper Oscillation -------------------
+void oscillateStepper() {
+  if (stopFlag || stepsPerSec <= 0) return;
+  unsigned long now = micros();
+  unsigned long stepDelay = 1000000L / stepsPerSec;
+  if ((long)(now - lastStepTime) < (long)stepDelay) return;
+
+  stepMotor();
+  lastStepTime = now;
+
+  switch (oscState) {
+    case TO_POS:
+      currentStepPos++;
+      if (currentStepPos >= stepsToMove) { oscState = TO_ZERO_FROM_POS; setDirection(false); }
+      break;
+    case TO_ZERO_FROM_POS:
+      currentStepPos--;
+      if (currentStepPos <= 0) { oscState = TO_NEG; setDirection(false); }
+      break;
+    case TO_NEG:
+      currentStepPos--;
+      if (currentStepPos <= -stepsToMove) { oscState = TO_ZERO_FROM_NEG; setDirection(true); }
+      break;
+    case TO_ZERO_FROM_NEG:
+      currentStepPos++;
+      if (currentStepPos >= 0) { oscState = TO_POS; setDirection(true); }
+      break;
+  }
+}
+
+float readNTCTemperature() {
+  int adc = analogRead(NTC_PIN);
+
+  if (adc == 0) return -100; // avoid div by zero
+
+  float voltage = adc / 4095.0;
+float resistance = SERIES_RESISTOR * voltage / (1.0 - voltage);
+
+  float steinhart;
+  steinhart = resistance / NOMINAL_RESISTANCE;
+  steinhart = log(steinhart);
+  steinhart /= BETA_COEFFICIENT;
+  steinhart += 1.0 / (NOMINAL_TEMPERATURE + 273.15);
+  steinhart = 1.0 / steinhart;
+  steinhart -= 273.15;
+
+  return steinhart;
+}
+
+void drawNTCTemperature() {
+  int w = 100;
+  int h = 20;
+  int x = tft.width() - w - 5;  // right side
+  int y = 5;
+
+  tft.fillRect(x, y, w, h, TFT_WHITE);
+
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setTextDatum(MC_DATUM);
+
+  String tempStr = String(ntcTemp, 1) + " C";
+  tft.drawString(tempStr, x + w/2, y + h/2);
+}
+
+void updateNTCTemp() {
+  static unsigned long lastRead = 0;
+
+  if (millis() - lastRead > 5000) {   // every 5 seconds
+    ntcTemp = readNTCTemperature();
+    lastRead = millis();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  sensors.begin();
+  pinMode(NTC_PIN, INPUT);
+  sensors.setWaitForConversion(false);
+sensors.requestTemperatures(); // start first conversion
+  lastMotor2Value = motor2Rotation;
+  delay(1000);
+  initializePins();
+  initializeDisplay();
+  refreshAllUIElements();
+  initializeWifi();
+  syncTime();
+  startAdvertisement();
+  initializeServer();
+  checkSketchSpace();
+  drawTemperature();
+  analogReadResolution(12);
+  Serial.println("System Ready.");
+}
+
+void loop() {
+  updateTimer();
+  wsServer.loop();
+  updateNTCTemp();
+  runMotor2();
+static float lastNTC = -100;
+
+if (abs(ntcTemp - lastNTC) > 0.1) {
+  drawNTCTemperature();
+  lastNTC = ntcTemp;
+}
+  static unsigned long lastTouch = 0;
+
+if (ts.touched() && millis() - lastTouch > 25) {
+  handleTouchInput();
+  lastTouch = millis();
+}
+  if (millis() - lastSyncMillis > syncInterval) {
+    syncTime();
+  }
+  
+  
+  if (millis() - lastSync > DATA_SYNC_INTERVAL) {
+    lastSync = millis();
+    if (deviceConnected) {
+      Serial.println("Performing Sync...");
+      sendData(true); 
+    }
+  }
+  
+  static unsigned long lastBTTempSend = 0;
+  if (millis() - lastBTTempSend > 2000) {
+    lastBTTempSend = millis();
+    bitFlag |= FLAG_TEMPERATURE;
+    sendData(false);
+  }
+
+   controlHeater();
+
+  static float lastTemp = -100;
+
+if (abs(currentTemp - lastTemp) > 0.1) {
+  drawTemperature();
+  lastTemp = currentTemp;
+}
+  
+ 
+  controlPumpByTemp();
+  oscillateStepper();
+}
